@@ -15,18 +15,31 @@
 ## Chromosome and position (build 37, base-pairs)
 
 ## R libraries needed:
-## vroom  # accessed through ::
-## ggGWAS # accessed through ::
+
+## accessed through ::
+## fs          
+## vroom    
+## readr      
+## data.table 
+## GWAS.utils                                  ## devtools::install_github("sinarueeger/GWAS.utils")
+## here
+## glue
+## ggrepel
+## stringr
+
+## requirements::req_file("R/howto_finemap.R") ## devtools::install_github("hadley/requirements")
+
 library(ggplot2)
 library(dplyr)
 theme_set(theme_bw())
-library(ggGWAS) # for plotting
-library(readr) ## read_delim
-library(data.table) ## reading in too
+library(ggGWAS) # for plotting: devtools::install_github("sinarueeger/ggGWAS")
 
 ## create a data folder
 fs::dir_create(here::here("data"))
 DIR_DATA <- here::here("data")
+
+## create a bin folder
+fs::dir_create(here::here("bin"))
 
 ## Data ------------------------
 ## -----------------------------
@@ -80,13 +93,18 @@ ggplot(data = dat) +
 ## download from here:
 ## www.christianbenner.com
 LDSTORE <- here::here("bin", "ldstore")
-FINEMAP <- here::here("bin", "finemap_v1.3.1_MacOSX")
+FINEMAP <- here::here("bin", "finemap")
 PLINK2 <- here::here("bin", "plink2")
 
 system_glued <- function(x)
 {
   system(glue::glue(x))
 }
+
+## checks
+if (!fs::file_exists(PLINK2)) message("Download PLINK2 from here: http://www.cog-genomics.org/plink/2.0/ and store the binary as bin/plink2 (v2.00 used).")
+if (!fs::file_exists(FINEMAP)) message("Download FINEMAP from here: http://www.christianbenner.com/# and store the binary as bin/finemap (v1.3.1 used).")
+if (!fs::file_exists(LDSTORE)) message("Download LDSTORE from here: http://www.christianbenner.com/# and store the binary as bin/ldstore (v1.1 used).")
 
 
 ## prepare reference data ----------------
@@ -182,7 +200,6 @@ data_z <- dat %>%
   
 
 ## TODO: get proper MAF
-#data_z <- data_z %>% slice(1:3000)
 
 readr::write_delim(
   data_z,
@@ -237,7 +254,7 @@ data_z %>% anti_join(out, c("rsid" = "RSID"))
 ## ----------------------------------------
 
 system_glued(
-  "{FINEMAP} --sss --in-files {DIR_DATA}/master --dataset 1 --log"
+  "{FINEMAP} --sss --in-files {DIR_DATA}/master --dataset 1"
 )
 
 
@@ -245,50 +262,124 @@ system_glued(
 ## read in results ------------------------
 ## ----------------------------------------
 
+
+locuszoom_wrapper <- function(data, y, K = NA, horiz_line = NA, labs_bottom_logic = TRUE, labs_top_logic = TRUE) {
+  
+  
+  
+  ## sort out annotation
+  if (labs_bottom_logic & labs_top_logic) {
+    anno <- labs(
+      title = glue::glue("Locuszoom plot for HDL GWAS"),
+      subtitle = glue::glue("Summary statistics for chromosome {CHR}, {BP_FROM}-{BP_TO}"),
+      caption = glue::glue(
+        "Data source\nSummary statistics: Surakka et al. 2015: {url_summary_stats}\n1000 Genomes Reference Panel: {url_reference_panel}"
+      )
+    )
+  }
+  
+  
+  if (labs_bottom_logic & !labs_top_logic) {
+    anno <- labs(
+      caption = glue::glue(
+        "Data source\nSummary statistics: Surakka et al. 2015: {url_summary_stats}\n1000 Genomes Reference Panel: {url_reference_panel}"
+      )
+    )
+  }
+  if (labs_top_logic & !labs_bottom_logic) {
+    anno <- labs(
+      title = glue::glue("Locuszoom plot for HDL GWAS"),
+      subtitle = glue::glue("Summary statistics for chromosome {CHR}, {BP_FROM}-{BP_TO}"),
+      caption = ""
+    )
+  }
+  
+  
+  ## actual plotting
+  
+  ggplot(data = data) +
+    ## add log10bf
+    geom_point(aes(position, {{ y }}, color = abs(LD))) +
+    scale_color_distiller("LD", type = "div", palette = "Spectral", limits = c(0, 1)) +
+
+    ## mark the lead variants
+    geom_point(aes(position, {{ y }}), shape = 3, size = 3, data = data %>% filter(lead_snp)) +
+    
+    ## mark the causal variants
+    geom_point(aes(position, {{ y }}), shape = 1, size = 3, data = data %>% filter(causal_snps)) +
+    
+    ## color the causal variants
+    ggrepel::geom_text_repel(aes(position, {{ y }}, label = rsid), data = data %>% filter(causal_snps)) +
+
+    ## Dashed lines correspond respectively to a single-SNP Bayes factor of 100
+    geom_hline(yintercept = horiz_line, linetype = 3) + 
+    
+    ## titles
+    anno
+  
+
+}
+
+## results -------------------------------
 snp <- data.table::fread(glue::glue("{FILE}.snp"))
 config <- data.table::fread(glue::glue("{FILE}.config"))
 ld_matrix <- data.table::fread(glue::glue("{FILE}.ld")) ## same order as data_z
 
-causal_snps <- config %>% slice(1) %>% pull(config) %>% stringr::str_split(",") %>% unlist()
-ld_top_snp <- data.frame(rsid = data_z$rsid, LD = as.data.frame(ld_matrix)[, which(data_z$rsid %in% causal_snps[1])])
+
+## replicate Figure 7 ---------------------
+top_hits_benner_finemap <- c("rs7350789", "rs1800588", "rs113298164")
+top_hits_benner_cond <- c("rs7350789", "rs1800588", "rs2043085")
+
+causal_snps <-
+  config %>% slice(1) %>% pull(config) %>% stringr::str_split(",") %>% unlist()
+lead_snp <- "rs2043085"
+ld_top_snp <-
+  data.frame(rsid = data_z$rsid, LD = as.data.frame(ld_matrix)[, which(data_z$rsid %in% lead_snp)])
 
 ## adding ld to snp
-snp <- snp %>% left_join(ld_top_snp)
+snp_plot <- snp %>%
+  left_join(ld_top_snp) %>%
+  mutate(causal_snps = case_when(rsid %in% causal_snps ~ TRUE,
+                                 TRUE ~ FALSE),
+         lead_snp = case_when(rsid %in% lead_snp ~ TRUE,
+                              TRUE ~ FALSE)) %>%
+  mutate(mlog10p = -log10(GWAS.utils::z2p(z)))
+
+plot_finemap <- locuszoom_wrapper(data = snp_plot, y = log10bf, K = 1, horiz_line = log10(100), labs_bottom_logic = FALSE, labs_top_logic = TRUE)
+plot_ss <- locuszoom_wrapper(data = snp_plot, y = mlog10p, K = 1, horiz_line = -log10(5*10^(-8) ), labs_bottom_logic = TRUE, labs_top_logic = FALSE)
+
+plot_grid(plot_finemap, plot_ss, nrow = 2)
+
+
+
+
+## Top 5 configurations -----------------
+message("This does not need to run")
+if (FALSE)
+{
+  plotlist <- list()
+  length(plotlist) <- 5
   
-ggplot(data = snp) +
-  ## add log10bf
-  geom_point(aes(position, log10bf, color = abs(LD))) +
-  scale_color_distiller("LD", type = "div", palette = "Spectral", limits = c(0, 1)) +
-
-  ## color the causal variants
-  geom_point(aes(position, log10bf), shape = 1, size = 3, data = snp %>% filter(rsid %in% causal_snps)) +
-
-  ## color the causal variants
-  ggrepel::geom_text_repel(aes(position, log10bf, label = rsid), data = snp %>% filter(rsid %in% causal_snps)) +
   
-  ## titles
-  labs(
-      title = "Locuszoom plot for HDL GWAS",
-      subtitle = glue::glue("Summary statistics for chromosome {CHR}, {BP_FROM}-{BP_TO}"),
-      caption = glue::glue("Data source: Surakka et al. 2015: {url_summary_stats}\n 1000 genomes ref panel: {url_reference_panel}")
-    )
-
-
-
-
-#
-# log10bf
-#
-# prob column contains the marginal Posterior Inclusion Probabilities (PIP). The PIP for the l th SNP is the posterior probability that this SNP is causal.
-#
-# log10bf column contains the log10 Bayes factors. The Bayes factor quantifies the evidence that the l th SNP is causal with log10 Bayes factors greater than 2 reporting considerable evidence
-#
-# group column contains the group number that the SNP belongs to
-#
-# corr_group column contains the correlation with the marginally most significant SNP among SNPs in the same group with this SNP
-#
-# prob_group column contains the posterior probability that there is at least one causal signal among SNPs in the same group with this SNP
-#
-# log10bf_group column contains the log10 Bayes factors for quantifying the evidence that there is at least one causal signal among SNPs in the same group with the SNP. Bayes factors greater than 2 report considerable evidence
-#
-#
+  for (K in 1:length(plotlist)) {
+    causal_snps <-
+      config %>% slice(K) %>% pull(config) %>% stringr::str_split(",") %>% unlist()
+    lead_snp <- "rs2043085"
+    ld_top_snp <-
+      data.frame(rsid = data_z$rsid, LD = as.data.frame(ld_matrix)[, which(data_z$rsid %in% lead_snp)])
+    
+    ## adding ld to snp
+    snp_plot <- snp %>%
+      left_join(ld_top_snp) %>%
+      mutate(causal_snps = case_when(rsid %in% causal_snps ~ TRUE,
+                                     TRUE ~ FALSE))
+    
+    
+    tmp <- locuszoom_wrapper(data = snp_plot, K = K)
+    
+    plotlist[[K]] <- tmp
+    
+  }
+  library(cowplot)
+  plot_grid(plotlist = plotlist, labels = "AUTO")
+}
